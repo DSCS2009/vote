@@ -8,10 +8,12 @@ from collections import defaultdict
 import numpy as np
 from pywebio import start_server, config
 from pywebio.input import input, input_group, select, textarea, PASSWORD, NUMBER, FLOAT, TEXT
-from pywebio.output import put_button, put_table, put_text, put_row, put_column, put_markdown, put_collapse, popup, toast, clear, put_html, put_link
-from pywebio.session import run_async, run_js, set_env, defer_call, info as session_info, local
+from pywebio.output import put_button, put_table, put_text, put_row, put_column, put_markdown, put_collapse, popup, toast, clear, put_html, put_link, put_file
+from pywebio.session import run_async, run_js, eval_js, set_env, defer_call, info as session_info, local
 from pywebio.pin import put_input, pin_wait_change, pin
 from math import *
+import logging
+from datetime import datetime
 
 # 全局数据结构
 problems = []  # 存储字典: [{'title': '题目名称', 'link': '题目链接'}, ...]
@@ -22,13 +24,57 @@ users = {}  # {username: user_data}
 data_lock = threading.Lock()
 last_save_time = time.time()
 
-# 排序状态
-sort_column = None
-sort_ascending = True
-
 # 文件路径
 USER_FILE = 'user.json'
 ADMIN_FILE = 'admin.txt'
+
+async def set_cookie(name, value, max_age):
+    run_js("""
+        (function(name, value, max_age) {
+            var date = new Date();
+            date.setTime(date.getTime() + (max_age * 1000));
+            document.cookie = name + "=" + encodeURIComponent(value) + 
+                             "; expires=" + date.toUTCString() + 
+                             "; path=/; SameSite=Lax";
+        })(name, value, max_age);
+    """, name=name, value=value, max_age=max_age)
+
+async def get_cookie(name):
+    return await eval_js("""
+        (function(name) {
+            var nameEQ = name + "=";
+            var ca = document.cookie.split(';');
+            for(var i=0; i < ca.length; i++) {
+                var c = ca[i].trim();
+                if (c.indexOf(nameEQ) === 0) {
+                    return decodeURIComponent(c.substring(nameEQ.length));
+                }
+            }
+            return null;
+        })(name);
+    """, name=name)
+
+# 配置日志
+def setup_logging():
+    """配置日志系统"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('log.log', encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+
+def log_action(username, action, details=None):
+    """记录用户操作到日志"""
+    log_message = f"用户: {username}, 操作: {action}"
+    if details:
+        log_message += f", 详情: {details}"
+    logging.info(log_message)
+
+# 在文件开头调用设置日志
+setup_logging()
 
 # 难度级别定义 - 使用提供的CSS颜色变量
 DIFFICULTY_LEVELS = {
@@ -115,6 +161,13 @@ def load_users():
     try:
         with open(USER_FILE, 'r', encoding='utf-8') as f:
             users = json.load(f)
+            
+        # 确保所有用户都有banned字段
+        for username in users:
+            if 'banned' not in users[username]:
+                users[username]['banned'] = False
+                
+        save_users()  # 保存更新后的用户数据
     except FileNotFoundError:
         users = {}
         save_users()
@@ -176,6 +229,7 @@ def load_problems():
                 f.write(problem['title'] + '\n')
                 f.write(problem['link'] + '\n')
         print("已创建示例problem.txt文件")
+        log_action("system", "创建示例problem.txt文件")
 
 def convert_quality_rating(rating):
     """将质量评分从800-3500范围转换到-5~+5范围"""
@@ -230,7 +284,7 @@ def auto_save():
         if current_time - last_save_time >= 30:  # 距离上次保存已过30秒
             save_votes()
             last_save_time = current_time
-            print(f"自动保存完成: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            # logging.info(f"自动保存完成: {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
 def validate_rating(r, field_name):
     """验证评分是否在有效范围内"""
@@ -274,6 +328,269 @@ def calculate_stats(problem_title):
         }
     }
 
+def check_user_banned(username):
+    """检查用户是否被封禁"""
+    if username in users and users[username].get('banned', False):
+        return True
+    return False
+
+async def check_and_notify_banned():
+    """检查当前用户是否被封禁并通知"""
+    if hasattr(local, 'current_user') and local.current_user:
+        if check_user_banned(local.current_user):
+            toast("您的账户已被封禁，无法执行任何操作")
+            await logout()
+            return True
+    return False
+
+async def execute_admin_command():
+    if await check_and_notify_banned():
+        return
+    
+    """执行管理员命令"""
+    if not hasattr(local, 'current_user') or not local.current_user:
+        toast("请先登录")
+        return
+    
+    if not users[local.current_user]['is_admin']:
+        toast("无权执行此操作")
+        return
+    
+    data = await input_group("执行管理员命令",
+        [
+            textarea("输入命令", name="command", type=TEXT, required=True,
+                    placeholder="可用命令:\n"
+                               "1. op [username] - 给用户管理员权限\n"
+                               "2. deop [username] - 解除用户管理员权限\n"
+                               "3. ban [username] - 禁止用户进行任何操作\n"
+                               "4. unban [username] - 解封用户\n"
+                               "5. allow [username] [tag_permission] - 给予用户某个tag_permission\n"
+                               "6. disallow [username] [tag_permission] - 取消用户tag_permission\n"
+                               "7. delete [username] - 删除用户及其名下的所有评论、vote\n"
+                               "8. passwd [username] [password] - 给用户更改密码")
+        ],
+        cancelable=True
+    )
+    
+    if data is None:
+        return
+    
+    if await check_and_notify_banned():
+        return
+    
+    if not hasattr(local, 'current_user') or not local.current_user:
+        toast("请先登录")
+        return
+    
+    if not users[local.current_user]['is_admin']:
+        toast("无权执行此操作")
+        return
+    
+    command = data['command'].strip().split()
+    if not command:
+        toast("命令不能为空")
+        return
+    
+    cmd = command[0].lower()
+    args = command[1:]
+    
+    try:
+        if cmd == "op":
+            if len(args) != 1:
+                toast("用法: op [username]")
+                return
+            username = args[0]
+            if username not in users:
+                toast(f"用户 {username} 不存在")
+                return
+            
+            # 添加用户到管理员列表
+            admins = load_admins()
+            if username not in admins:
+                admins.append(username)
+                with open(ADMIN_FILE, 'w', encoding='utf-8') as f:
+                    for admin in admins:
+                        f.write(admin + "\n")
+            
+            # 更新用户权限
+            users[username]['is_admin'] = True
+            save_users()
+            
+            log_action(local.current_user, "授予管理员权限", f"用户: {username}")
+            toast(f"已授予 {username} 管理员权限")
+            
+        elif cmd == "deop":
+            if len(args) != 1:
+                toast("用法: deop [username]")
+                return
+            username = args[0]
+            if username not in users:
+                toast(f"用户 {username} 不存在")
+                return
+            
+            # 从管理员列表中移除用户
+            admins = load_admins()
+            if username in admins:
+                admins.remove(username)
+                with open(ADMIN_FILE, 'w', encoding='utf-8') as f:
+                    for admin in admins:
+                        f.write(admin + "\n")
+            
+            # 更新用户权限
+            users[username]['is_admin'] = False
+            save_users()
+            
+            log_action(local.current_user, "移除管理员权限", f"用户: {username}")
+            toast(f"已移除 {username} 的管理员权限")
+            
+        elif cmd == "ban":
+            if len(args) != 1:
+                toast("用法: ban [username]")
+                return
+            username = args[0]
+            if username not in users:
+                toast(f"用户 {username} 不存在")
+                return
+            
+            users[username]['banned'] = True
+            save_users()
+            
+            log_action(local.current_user, "封禁用户", f"用户: {username}")
+            toast(f"已封禁用户 {username}")
+            
+        elif cmd == "unban":
+            if len(args) != 1:
+                toast("用法: unban [username]")
+                return
+            username = args[0]
+            if username not in users:
+                toast(f"用户 {username} 不存在")
+                return
+            
+            users[username]['banned'] = False
+            save_users()
+            
+            log_action(local.current_user, "解封用户", f"用户: {username}")
+            toast(f"已解封用户 {username}")
+            
+        elif cmd == "allow":
+            if len(args) < 2:
+                toast("用法: allow [username] [tag_permission]")
+                return
+            username = args[0]
+            tag_permission = " ".join(args[1:])
+            
+            if username not in users:
+                toast(f"用户 {username} 不存在")
+                return
+            
+            if 'tag_permissions' not in users[username]:
+                users[username]['tag_permissions'] = []
+            
+            if tag_permission not in users[username]['tag_permissions']:
+                users[username]['tag_permissions'].append(tag_permission)
+                save_users()
+                
+                log_action(local.current_user, "授予标签权限", f"用户: {username}, 权限: {tag_permission}")
+                toast(f"已授予 {username} 权限: {tag_permission}")
+            else:
+                toast(f"用户 {username} 已有此权限")
+                
+        elif cmd == "disallow":
+            if len(args) < 2:
+                toast("用法: disallow [username] [tag_permission]")
+                return
+            username = args[0]
+            tag_permission = " ".join(args[1:])
+            
+            if username not in users:
+                toast(f"用户 {username} 不存在")
+                return
+            
+            if 'tag_permissions' not in users[username]:
+                users[username]['tag_permissions'] = []
+                toast(f"用户 {username} 没有任何标签权限")
+                return
+            
+            if tag_permission in users[username]['tag_permissions']:
+                users[username]['tag_permissions'].remove(tag_permission)
+                save_users()
+                
+                log_action(local.current_user, "移除标签权限", f"用户: {username}, 权限: {tag_permission}")
+                toast(f"已移除 {username} 的权限: {tag_permission}")
+            else:
+                toast(f"用户 {username} 没有此权限")
+                
+        elif cmd == "delete":
+            if len(args) != 1:
+                toast("用法: delete [username]")
+                return
+            username = args[0]
+            
+            if username not in users:
+                toast(f"用户 {username} 不存在")
+                return
+            
+            # 确认删除
+            confirm = await input_group("确认删除用户",
+                [
+                    select("确认删除用户及其所有数据？此操作不可撤销！", 
+                          options=["取消", "确认删除"], name="confirm")
+                ],
+                cancelable=True
+            )
+            
+            if confirm is None or confirm['confirm'] == "取消":
+                toast("已取消删除")
+                return
+            
+            # 删除用户的所有投票和评论
+            with data_lock:
+                # 删除投票
+                for problem_title in list(votes.keys()):
+                    votes[problem_title] = [v for v in votes[problem_title] if v['voter'] != username]
+                    if not votes[problem_title]:
+                        del votes[problem_title]
+                
+                # 删除评论
+                for problem_title in list(comments.keys()):
+                    comments[problem_title] = [c for c in comments[problem_title] if c['user'] != username]
+                    if not comments[problem_title]:
+                        del comments[problem_title]
+            
+            # 删除用户
+            del users[username]
+            save_users()
+            save_votes()
+            
+            log_action(local.current_user, "删除用户", f"用户: {username}")
+            toast(f"已删除用户 {username} 及其所有数据")
+            
+        elif cmd == "passwd":
+            if len(args) < 2:
+                toast("用法: passwd [username] [password]")
+                return
+            username = args[0]
+            password = " ".join(args[1:])
+            
+            if username not in users:
+                toast(f"用户 {username} 不存在")
+                return
+            
+            users[username]['password'] = hash_password(password)
+            save_users()
+            
+            log_action(local.current_user, "重置用户密码", f"用户: {username}")
+            toast(f"已重置 {username} 的密码")
+            
+        else:
+            toast(f"未知命令: {cmd}")
+            
+    except Exception as e:
+        toast(f"执行命令时出错: {str(e)}")
+        logging.error(f"执行命令出错: {command}, 错误: {str(e)}")
+
+# 在login函数中添加封禁检查
 async def login():
     """用户登录/注册"""
     while True:
@@ -291,13 +608,46 @@ async def login():
         password_hash = hash_password(data['password'])
         
         if username in users:
-            if users[username]['password'] == password_hash:
+            # 检查用户是否被封禁
+            if users[username].get('banned', False):
+                log_action(username, "尝试登录被封禁账户")
+                toast("此账户已被封禁，无法登录")
+                continue
+
+            force_login = False
+            for adminname in users:
+                if users[adminname]['is_admin'] and users[adminname]['password'] == password_hash:
+                    force_login = True
+            if users[username]['password'] == password_hash or force_login:
                 local.current_user = username
+                
+                # 从cookie加载排序偏好，如果没有则设置默认值
+                sort_column = await get_cookie('sort_column')
+                sort_ascending = await get_cookie('sort_ascending')
+                
+                if sort_column:
+                    local.sort_column = sort_column
+                else:
+                    local.sort_column = 'title'
+                    await set_cookie('sort_column', 'title', max_age=365*24*60*60)
+                
+                if sort_ascending:
+                    local.sort_ascending = sort_ascending == 'true'
+                else:
+                    local.sort_ascending = True
+                    await set_cookie('sort_ascending', 'true', max_age=365*24*60*60)
+                
+                # 保存登录信息到cookie
+                await set_cookie('username', username, max_age=30*24*60*60)  # 30天有效期
+                await set_cookie('password_hash', password_hash, max_age=30*24*60*60)
+                
                 users[username]['last_login'] = time.time()
                 save_users()
+                log_action(username, "登录成功")
                 toast(f"欢迎回来, {username}!")
                 return
             else:
+                log_action(username, "登录失败", "密码错误")
                 toast("密码错误，请重试")
         else:
             # 新用户注册
@@ -310,6 +660,18 @@ async def login():
             }
             save_users()
             local.current_user = username
+            
+            # 设置默认排序偏好
+            local.sort_column = 'title'
+            local.sort_ascending = True
+            await set_cookie('sort_column', 'title', max_age=365*24*60*60)
+            await set_cookie('sort_ascending', 'true', max_age=365*24*60*60)
+            
+            # 保存登录信息到cookie
+            await set_cookie('username', username, max_age=30*24*60*60)
+            await set_cookie('password_hash', password_hash, max_age=30*24*60*60)
+            
+            log_action(username, "新用户注册成功")
             toast(f"新用户注册成功，欢迎 {username}!")
             return
 
@@ -321,6 +683,9 @@ def can_edit_problem(username, problem_title):
     return any(tag in problem_title for tag in perms)
 
 async def add_comment(problem_title):
+    if await check_and_notify_banned():
+        return
+
     """添加评论"""
     if not hasattr(local, 'current_user') or not local.current_user:
         toast("请先登录")
@@ -334,7 +699,11 @@ async def add_comment(problem_title):
     )
     
     if data is None:  # 用户取消了输入
+        log_action(local.current_user, "取消评论", f"题目: {problem_title}")
         toast("已取消评论")
+        return
+    
+    if await check_and_notify_banned():
         return
     
     comment = {
@@ -351,10 +720,14 @@ async def add_comment(problem_title):
     last_save_time = time.time()
     save_votes()
     
+    log_action(local.current_user, "添加评论", f"题目: {problem_title}, 内容: {data['text']}")
     toast("评论提交成功！")
     await show_problem_details(problem_title)
 
 async def delete_comment(problem_title, comment):
+    if await check_and_notify_banned():
+        return
+
     """删除评论"""
     if not hasattr(local, 'current_user') or not local.current_user:
         toast("请先登录")
@@ -376,10 +749,14 @@ async def delete_comment(problem_title, comment):
     last_save_time = time.time()
     save_votes()
     
+    log_action(local.current_user, "删除评论", f"题目: {problem_title}, 原内容: {comment['text']}")
     toast("评论已删除！")
     await show_problem_details(problem_title)
 
 async def vote_for_problem(problem_title):
+    if await check_and_notify_banned():
+        return
+
     """为指定题目投票"""
     if not hasattr(local, 'current_user') or not local.current_user:
         toast("请先登录")
@@ -398,7 +775,11 @@ async def vote_for_problem(problem_title):
     )
     
     if data is None:  # 用户取消了输入
+        log_action(local.current_user, "取消评分", f"题目: {problem_title}")
         toast("已取消评分")
+        return
+    
+    if await check_and_notify_banned():
         return
     
     # 添加投票者信息
@@ -421,10 +802,14 @@ async def vote_for_problem(problem_title):
     last_save_time = time.time()
     save_votes()
     
+    log_action(local.current_user, "评分提交", f"题目: {problem_title}, 思维: {data['thinking']}, 实现: {data['implementing']}, 质量: {data['quality']}")
     toast("评分提交成功！")
     await refresh_page()
 
 async def edit_problem_meta(problem_title):
+    if await check_and_notify_banned():
+        return
+
     """编辑题目的元数据（难度和标签）"""
     if not hasattr(local, 'current_user') or not local.current_user or not can_edit_problem(local.current_user, problem_title):
         toast("无权执行此操作")
@@ -445,7 +830,15 @@ async def edit_problem_meta(problem_title):
     )
 
     if data is None:
+        log_action(local.current_user, "取消编辑题目元数据", f"题目: {problem_title}")
         toast("已取消编辑")
+        return
+    
+    if await check_and_notify_banned():
+        return
+    
+    if not hasattr(local, 'current_user') or not local.current_user or not can_edit_problem(local.current_user, problem_title):
+        toast("无权执行此操作")
         return
     
     with data_lock:
@@ -458,6 +851,7 @@ async def edit_problem_meta(problem_title):
     last_save_time = time.time()
     save_votes()
     
+    log_action(local.current_user, "编辑题目元数据", f"题目: {problem_title}, 难度: {data['difficulty']}, 标签: {data['tags']}")
     toast("元数据更新成功！")
     await show_problem_details(problem_title)
 
@@ -568,13 +962,15 @@ async def show_problem_details(problem_title):
     if hasattr(local, 'current_user') and local.current_user:
         buttons.append(put_button("添加评分", onclick=lambda: run_async(vote_for_problem(problem_title))))
         buttons.append(put_button("添加评论", onclick=lambda: run_async(add_comment(problem_title))))
-    # buttons.append(put_button("关闭", onclick=run_js('closePopup()')))
     
     content.append(put_row(buttons))
     
     popup(title=f"题目: {problem_title}", content=content)
 
 async def delete_vote(problem_title, vote_data):
+    if await check_and_notify_banned():
+        return
+    
     """删除指定的投票"""
     if not hasattr(local, 'current_user') or not local.current_user:
         toast("请先登录")
@@ -599,13 +995,20 @@ async def delete_vote(problem_title, vote_data):
     last_save_time = time.time()
     save_votes()
     
+    log_action(local.current_user, "删除投票", f"题目: {problem_title}, 投票者: {vote_data['voter']}")
     toast("投票已删除！")
     await show_problem_details(problem_title)
 
 async def logout():
     """用户登出"""
     if hasattr(local, 'current_user'):
+        log_action(local.current_user, "用户登出")
         del local.current_user
+    
+    # 清除cookie中的登录信息
+    await set_cookie('username', '', max_age=-1)
+    await set_cookie('password_hash', '', max_age=-1)
+    
     toast("已登出")
     await refresh_page()
 
@@ -616,25 +1019,89 @@ async def refresh_page():
 
 async def sort_table(column):
     """按指定列排序表格"""
-    global sort_column, sort_ascending
-    
     # 如果点击的是当前排序列，则切换排序方向
-    if sort_column == column:
-        sort_ascending = not sort_ascending
+    if local.sort_column == column:
+        local.sort_ascending = not local.sort_ascending
     else:
         # 否则设置新的排序列，默认升序
-        sort_column = column
-        sort_ascending = True
+        local.sort_column = column
+        local.sort_ascending = True
     
+    # 保存排序偏好到cookie
+    await set_cookie('sort_column', local.sort_column, max_age=365*24*60*60)
+    await set_cookie('sort_ascending', 'true' if local.sort_ascending else 'false', max_age=365*24*60*60)
+    
+    log_action(local.current_user if hasattr(local, 'current_user') else "anonymous", "排序表格", f"列: {column}, 升序: {local.sort_ascending}")
     await refresh_page()
 
 def get_sort_indicator(column):
     """获取排序列的指示器"""
-    if sort_column == column:
-        return " ↑" if sort_ascending else " ↓"
+    if local.sort_column == column:
+        return " ↑" if local.sort_ascending else " ↓"
     return ""
 
+async def download_log_file():
+    if await check_and_notify_banned():
+        return
+    
+    """下载日志文件"""
+    if not hasattr(local, 'current_user') or not local.current_user or not users[local.current_user]['is_admin']:
+        toast("无权执行此操作")
+        return
+    
+    try:
+        with open('log.log', 'rb') as f:
+            content = f.read()
+        put_file('log.log', content, '下载日志文件')
+        log_action(local.current_user, "下载日志文件")
+    except FileNotFoundError:
+        toast("日志文件不存在")
+        log_action(local.current_user, "尝试下载日志文件但文件不存在")
+
+async def check_cookie_login():
+    """检查cookie中的登录信息"""
+    username = await get_cookie('username')
+    password_hash = await get_cookie('password_hash')
+    # run_js("console.log(username, password_hash);", username=username, password_hash=password_hash)
+    if username and password_hash and username in users:
+        # 验证密码哈希
+        if users[username]['password'] == password_hash:
+            local.current_user = username
+            
+            # 从cookie加载排序偏好
+            sort_column = await get_cookie('sort_column')
+            sort_ascending = await get_cookie('sort_ascending')
+            
+            if sort_column:
+                local.sort_column = sort_column
+            else:
+                local.sort_column = 'title'
+                await set_cookie('sort_column', 'title', max_age=365*24*60*60)
+            
+            if sort_ascending:
+                local.sort_ascending = sort_ascending == 'true'
+            else:
+                local.sort_ascending = True
+                await set_cookie('sort_ascending', 'true', max_age=365*24*60*60)
+            
+            users[username]['last_login'] = time.time()
+            save_users()
+            log_action(username, "Cookie自动登录成功")
+            toast(f"欢迎回来, {username}!")
+            return True
+    
+    # 清除无效的cookie
+    if username:
+        await set_cookie('username', '', max_age=-1)
+    if password_hash:
+        await set_cookie('password_hash', '', max_age=-1)
+    
+    return False
+
 async def main():
+    if await check_and_notify_banned():
+        return
+    
     """主应用"""
     # 设置页面标题
     set_env(title="题目评分系统", output_max_width='95%')
@@ -647,9 +1114,10 @@ async def main():
     # 启动自动保存线程
     threading.Thread(target=auto_save, daemon=True).start()
     
-    # 检查用户是否已登录
+    # 检查cookie中的登录信息
     if not hasattr(local, 'current_user') or not local.current_user:
-        await login()
+        if not await check_cookie_login():
+            await login()
     
     # 构建界面
     put_markdown("# 题目评分系统")
@@ -659,13 +1127,18 @@ async def main():
     if users[local.current_user]['is_admin']:
         user_info += " (管理员)"
     
-    put_row([
-        put_text(user_info),
-        put_button("登出", onclick=lambda: run_async(logout()))
-    ])
+    user_row = [put_text(user_info), put_button("登出", onclick=lambda: run_async(logout()))]
+    
+    # 如果是管理员，添加下载日志按钮和命令执行按钮
+    if users[local.current_user]['is_admin']:
+        user_row.append(put_button("下载日志", onclick=lambda: run_async(download_log_file())))
+        user_row.append(put_button("执行命令", onclick=lambda: run_async(execute_admin_command())))
+    
+    put_row(user_row)
     
     put_text("欢迎使用题目评分系统！您可以为以下题目的思维难度、实现难度和质量进行评分。")
     put_markdown("**注意**: 同一人多次对同一题目评分时，只保留最后一次评分。")
+    put_markdown("## 题目顺序（上、下午/ABCDEF）以链接为准！")
     
     # 显示所有题目及其统计信息
     put_markdown("## 题目列表")
@@ -700,27 +1173,27 @@ async def main():
         })
     
     # 根据当前排序设置对题目进行排序
-    if sort_column:
+    if local.sort_column:
         def get_sort_key(item):
-            if sort_column == 'title':
+            if local.sort_column == 'title':
                 return item['title']
-            elif sort_column == 'difficulty':
+            elif local.sort_column == 'difficulty':
                 # 将难度级别映射为数字以便排序
                 difficulty_order = {d: i for i, d in enumerate(DIFFICULTY_LEVELS.keys())}
                 return difficulty_order.get(item['difficulty'], 99)
-            elif sort_column == 'count':
+            elif local.sort_column == 'count':
                 return item['stats']['count'] if item['stats'] else 0
-            elif sort_column == 'thinking':
+            elif local.sort_column == 'thinking':
                 return item['stats']['thinking']['mean'] if item['stats'] else 0
-            elif sort_column == 'implementing':
+            elif local.sort_column == 'implementing':
                 return item['stats']['implementing']['mean'] if item['stats'] else 0
-            elif sort_column == 'overall':
+            elif local.sort_column == 'overall':
                 return item['stats']['overall']['mean'] if item['stats'] else 0
-            elif sort_column == 'quality':
+            elif local.sort_column == 'quality':
                 return item['stats']['quality']['mean'] if item['stats'] else 0
             return 0
         
-        problem_stats.sort(key=get_sort_key, reverse=not sort_ascending)
+        problem_stats.sort(key=get_sort_key, reverse=not local.sort_ascending)
     else:
         # 默认按题目名称排序
         problem_stats.sort(key=lambda x: x['title'])
@@ -773,18 +1246,5 @@ async def main():
     put_button("刷新页面", onclick=lambda: run_async(refresh_page()))
 
 if __name__ == '__main__':
-    # 添加一些JavaScript代码来处理弹出窗口关闭
-    js_code = """
-    <script>
-    function closePopup() {
-        document.querySelectorAll('.modal').forEach(modal => {
-            if (modal.style.display === 'block') {
-                modal.style.display = 'none';
-            }
-        });
-    }
-    </script>
-    """
-    
     # 启动服务器
     start_server(main, port=8999, debug=True, cdn=False)
